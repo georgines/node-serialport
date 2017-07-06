@@ -272,7 +272,6 @@ NAN_METHOD(Write) {
   baton->buffer.Reset(buffer);
   baton->bufferData = bufferData;
   baton->bufferLength = bufferLength;
-  baton->offset = 0;
   baton->callback.Reset(info[2].As<v8::Function>());
 
   uv_work_t* req = new uv_work_t();
@@ -282,45 +281,32 @@ NAN_METHOD(Write) {
 }
 
 void EIO_Write(uv_work_t* req) {
-  WriteBaton* data = static_cast<WriteBaton*>(req->data);
-  data->result = 0;
+  WriteBaton* baton = static_cast<WriteBaton*>(req->data);
 
-  do {
-    OVERLAPPED ov = {0};
-    // Event used by GetOverlappedResult(..., TRUE) to wait for outgoing data or timeout
-    // Event MUST be used if program has several simultaneous asynchronous operations
-    // on the same handle (i.e. ReadFile and WriteFile)
-    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+  OVERLAPPED ov = new OVERLAPPED();
+  ov.hEvent = baton;
 
-    // Start write operation - synchronous or asynchronous
-    DWORD bytesWritten = 0;
-    if (!WriteFile((HANDLE)data->fd, data->bufferData, static_cast<DWORD>(data->bufferLength), &bytesWritten, &ov)) {
-      DWORD lastError = GetLastError();
-      if (lastError != ERROR_IO_PENDING) {
-        // Write operation error
-        ErrorCodeToString("Writing to COM port (WriteFile)", lastError, data->errorString);
-        CloseHandle(ov.hEvent);
-        return;
-      }
-      // Write operation is completing asynchronously
-      // We MUST wait for the operation completion before deallocation of OVERLAPPED struct
-      // or write data buffer
+  if (0 == WriteFileEx((HANDLE)baton->fd, baton->bufferData, static_cast<DWORD>(baton->bufferLength), ov, EIO_AfterOverlappedWrite)) {
+    ErrorCodeToString("Writing to COM port (WriteFileEx)", GetLastError(), baton->errorString);
+    delete ov;
+    return;
+  }
+}
 
-      // block for async write operation completion
-      bytesWritten = 0;
-      if (!GetOverlappedResult((HANDLE)data->fd, &ov, &bytesWritten, TRUE)) {
-        // Write operation error
-        DWORD lastError = GetLastError();
-        ErrorCodeToString("Writing to COM port (GetOverlappedResult)", lastError, data->errorString);
-        CloseHandle(ov.hEvent);
-        return;
-      }
-    }
-    // Write operation completed synchronously
-    data->result = bytesWritten;
-    data->offset += data->result;
-    CloseHandle(ov.hEvent);
-  } while (data->bufferLength > data->offset);
+void EIO_AfterOverlappedWrite(DWORD errorCode, DWORD bytesWritten, OVERLAPPED ov) {
+  Nan::HandleScope scope;
+  WriteBaton* baton = static_cast<WriteBaton*>(ov->hEvent);
+  // check ov ?
+  delete ov;
+
+  v8::Local<v8::Value> argv[1];
+  if (baton->errorString[0]) {
+    argv[0] = v8::Exception::Error(Nan::New<v8::String>(baton->errorString).ToLocalChecked());
+  } else {
+    argv[0] = Nan::Null();
+  }
+  baton->callback.Call(1, argv);
+  delete baton;
 }
 
 void EIO_AfterWrite(uv_work_t* req) {
@@ -331,11 +317,9 @@ void EIO_AfterWrite(uv_work_t* req) {
   v8::Local<v8::Value> argv[1];
   if (baton->errorString[0]) {
     argv[0] = v8::Exception::Error(Nan::New<v8::String>(baton->errorString).ToLocalChecked());
-  } else {
-    argv[0] = Nan::Null();
+    baton->callback.Call(1, argv);
+    delete baton;
   }
-  baton->callback.Call(1, argv);
-  delete baton;
 }
 
 NAN_METHOD(Read) {
